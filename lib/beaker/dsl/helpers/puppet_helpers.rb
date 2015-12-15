@@ -134,8 +134,10 @@ module Beaker
           logger.debug "Setting curl retries to #{curl_retries}"
 
           if options[:is_puppetserver]
-            confdir = host.puppet('master')['confdir']
-            vardir = host.puppet('master')['vardir']
+            old_confdir = host.puppet('master')['confdir']
+            old_vardir = host.puppet('master')['vardir']
+            new_confdir = nil
+            new_vardir = nil
 
             if cmdline_args
               split_args = cmdline_args.split()
@@ -143,26 +145,32 @@ module Beaker
               split_args.each do |arg|
                 case arg
                 when /--confdir=(.*)/
-                  confdir = $1
+                  new_confdir = $1
                 when /--vardir=(.*)/
-                  vardir = $1
+                  new_vardir = $1
                 end
               end
             end
 
-            puppetserver_opts = { "jruby-puppet" => {
-              "master-conf-dir" => confdir,
-              "master-var-dir" => vardir,
-            }}
+            if new_confdir || new_vardir
+              puppetserver_opts = { "jruby-puppet" => {
+                "master-conf-dir" => new_confdir,
+                "master-var-dir" => new_vardir,
+              }}
 
-            puppetserver_conf = File.join("#{host['puppetserver-confdir']}", "puppetserver.conf")
-            modify_tk_config(host, puppetserver_conf, puppetserver_opts)
+              puppetserver_conf = File.join("#{host['puppetserver-confdir']}", "puppetserver.conf")
+              modify_tk_config(host, puppetserver_conf, puppetserver_opts)
+              restart_required = true
+            end
           end
           begin
             backup_file = backup_the_file(host, host.puppet('master')['confdir'], testdir, 'puppet.conf')
             lay_down_new_puppet_conf host, conf_opts, testdir
 
-            if host.use_service_scripts? && !service_args[:bypass_service_script]
+            if options[:is_puppetserver] && !restart_required && !service_args[:bypass_service_script]
+              host.exec puppet_resource('service', host['puppetservice'], 'ensure=running')
+              reload_puppetserver( host )
+            elsif host.use_service_scripts? && !service_args[:bypass_service_script]
               bounce_service( host, host['puppetservice'], curl_retries )
             else
               puppet_master_started = start_puppet_from_source_on!( host, cmdline_args )
@@ -179,7 +187,21 @@ module Beaker
           ensure
             begin
 
-              if host.use_service_scripts? && !service_args[:bypass_service_script]
+              if options[:is_puppetserver] && !service_args[:bypass_service_script]
+                restore_puppet_conf_from_backup( host, backup_file )
+                if restart_required
+                  puppetserver_opts = { "jruby-puppet" => {
+                    "master-conf-dir" => old_confdir,
+                    "master-var-dir" => old_vardir,
+                  }}
+
+                  puppetserver_conf = File.join("#{host['puppetserver-confdir']}", "puppetserver.conf")
+                  modify_tk_config(host, puppetserver_conf, puppetserver_opts)
+                  bounce_service( host, host['puppetservice'], curl_retries )
+                else
+                  reload_puppetserver( host )
+                end
+              elsif host.use_service_scripts? && !service_args[:bypass_service_script]
                 restore_puppet_conf_from_backup( host, backup_file )
                 if restart_when_done
                   bounce_service( host, host['puppetservice'], curl_retries )
@@ -320,6 +342,11 @@ module Beaker
             host.exec puppet_resource('service', service, 'ensure=running')
           end
           curl_with_retries(" #{service} ", host, "https://localhost:#{port}", [35, 60], curl_retries)
+        end
+
+        def reload_puppetserver host, port=nil
+          port = options[:puppetserver_port] || port
+          curl_on host, "-X DELETE -k https://localhost:#{port}/puppet-admin-api/v1/jruby-pool --cert #{host.puppet('master')['hostcert']} --key #{host.puppet('master')['hostprivkey']}"
         end
 
         # Runs 'puppet apply' on a remote host, piping manifest through stdin
